@@ -31,6 +31,29 @@ func MatchPackageByCPEs(vulnProvider vulnerability.Provider, p pkg.Package, upst
 	return results.ToMatches(), ignore, nil
 }
 
+// ReconcileCPEResults removes CPE (NVD) findings that the distro feed has already settled for the
+// same package, returning only the CPE findings the distro has no authoritative opinion on. The
+// caller is responsible for recording distro-fixed ignores (it already does so while building the
+// distro fixed set), so this function does not emit its own and cannot create duplicate ignores.
+//
+// This is what suppresses backport false positives: a distro ships a fix on a frozen version line
+// (e.g. 1.1.1w-0+deb11u2), so an NVD record written against upstream version numbers still flags that
+// package as vulnerable even though the distro has patched it. NVD cannot know about a distro's
+// backported fix, so the distro feed must win whenever it speaks.
+//
+// Both reconciliation inputs are result.Sets already fetched for the package, so this is in-memory
+// identity (ID + alias) bookkeeping with no additional database queries -- reconciling cannot add to
+// scan time. cpeIgnores are the "CPE not vulnerable" ignores produced while searching and are passed
+// through untouched.
+func ReconcileCPEResults(cpeVulnerable, distroVulnerable, distroFixed result.Set, cpeIgnores []match.IgnoreFilter) ([]match.Match, []match.IgnoreFilter) {
+	// Anything the distro still considers vulnerable is already reported by the authoritative distro
+	// match, and anything it considers fixed/unaffected is settled. NVD only contributes where the
+	// distro feed is silent.
+	reconciled := cpeVulnerable.Remove(distroVulnerable).Remove(distroFixed)
+
+	return reconciled.ToMatches(), cpeIgnores
+}
+
 // FindResultsByCPEs retrieves all vulnerabilities that match any of the provided package's CPEs as a
 // result.Set, so callers can reconcile them against other sources by vulnerability identity. Records
 // the CPE search finds but whose version is not affected are returned as "CPE not vulnerable" ignores.

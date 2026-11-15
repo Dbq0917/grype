@@ -424,9 +424,12 @@ func Test_addEpochIfApplicable(t *testing.T) {
 
 // TestMatcherRpm_CPEFallbackWhenEOL_EOLDistroEnabled exercises the EOL CPE
 // fallback for an EOL distro (RHEL 7, EOL 2024-06-30) using real RHEL + EOL +
-// NVD data. With UseCPEsForEOL=true, the matcher falls back to CPE matching
-// via NVD since the distro is past EOL, so we expect both the rhel:7 distro
-// disclosure AND the nvd CPE finding for the same CVE.
+// NVD data. With UseCPEsForEOL=true, the matcher also searches via NVD since the
+// distro is past EOL. The distro feed is authoritative for the packages it
+// ships, so the NVD CPE finding for a CVE the distro disclosure already reports
+// is reconciled away (deduped) rather than reported a second time. The package is
+// genuinely still vulnerable, so the only output is the single rhel:7 distro match
+// (no ignore: nothing was fixed, the NVD record was simply a duplicate).
 func TestMatcherRpm_CPEFallbackWhenEOL_EOLDistroEnabled(t *testing.T) {
 	dbtest.DBs(t, "eol-rhel7").Run(func(t *testing.T, db *dbtest.DB) {
 		matcher := NewRpmMatcher(MatcherConfig{UseCPEsForEOL: true})
@@ -440,13 +443,11 @@ func TestMatcherRpm_CPEFallbackWhenEOL_EOLDistroEnabled(t *testing.T) {
 			Build()
 
 		findings := db.Match(t, matcher, p)
-		ms := findings.SelectMatches("CVE-2018-0735")
-		ms.WithDetailType(match.CPEMatch).
-			SelectDetailByCPE("cpe:2.3:a:openssl:openssl:1.1.0a:*:*:*:*:*:*:*").
-			HasMatchType(match.CPEMatch)
-		ms.WithDetailType(match.ExactDirectMatch).
+		// only the authoritative distro match survives; no duplicate NVD CPE match
+		findings.SelectMatch("CVE-2018-0735").
 			SelectDetailByDistro("redhat", "7").
 			HasMatchType(match.ExactDirectMatch)
+		findings.Ignores().IsEmpty()
 	})
 }
 
@@ -574,4 +575,61 @@ func TestMatcherRpm_CPEMatchingWhenEnabled(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestMatcherRpm_NvdDroppedWhenDistroHasBackportFix covers the RPM backport false positive. RHEL 8
+// ships the CVE-2018-0735 fix as 1:1.1.1c-2.el8 on the frozen 1.1.1 line; NVD's CPE record treats
+// every 1.1.1 build as vulnerable because it has no distro fix knowledge. With CPE matching enabled,
+// that NVD finding must be reconciled against the RHEL "not vulnerable at this version" verdict
+// instead of producing a false high-severity match. The distro verdict still emits its ignore.
+func TestMatcherRpm_NvdDroppedWhenDistroHasBackportFix(t *testing.T) {
+	dbtest.DBs(t, "rhel8").
+		SelectOnly("rhel:8/cve-2018-0735", "CVE-2018-0735").
+		Run(func(t *testing.T, db *dbtest.DB) {
+			matcher := NewRpmMatcher(MatcherConfig{UseCPEs: true})
+
+			pkgID := pkg.ID("openssl-backport-fixed")
+			// at/above the RHEL fix 1:1.1.1c-2.el8, but the CPE version still reads 1.1.1c to NVD
+			p := dbtest.NewPackage("openssl", "1:1.1.1c-2.el8", syftPkg.RpmPkg).
+				WithID(pkgID).
+				WithArchitecture("x86_64").
+				WithDistro(dbtest.RHEL8).
+				WithMetadata(pkg.RpmMetadata{Epoch: intPtr(1)}).
+				WithCPE("cpe:2.3:a:openssl:openssl:1.1.1c:*:*:*:*:*:*:*").
+				Build()
+
+			// no surviving match (RHEL says fixed; the NVD duplicate is reconciled away); the distro
+			// path records the not-vulnerable verdict as an ignore so the suppression stays observable
+			findings := db.Match(t, matcher, p)
+			findings.Ignores().
+				SelectRelatedPackageIgnore(IgnoreReasonDistroNotVulnerable, "CVE-2018-0735").
+				ForPackage(pkgID).
+				WithRelationshipType(artifact.OwnershipByFileOverlapRelationship)
+			findings.Ignores().
+				SelectRelatedPackageIgnore("CPE not vulnerable", "CVE-2018-0735").
+				ForPackage(pkgID).
+				WithRelationshipType(artifact.OwnershipByFileOverlapRelationship)
+		})
+}
+
+// TestMatcherRpm_NvdKeptWhenDistroFeedIsSilent verifies reconciliation does not over-suppress: an NVD
+// CPE finding on a package the RHEL feed has no record for is still reported, since there is no distro
+// verdict to defer to.
+func TestMatcherRpm_NvdKeptWhenDistroFeedIsSilent(t *testing.T) {
+	dbtest.DBs(t, "rhel8").
+		SelectOnly("CVE-2018-0735").
+		Run(func(t *testing.T, db *dbtest.DB) {
+			matcher := NewRpmMatcher(MatcherConfig{UseCPEs: true})
+
+			p := dbtest.NewPackage("vendor-openssl", "1.1.1", syftPkg.RpmPkg).
+				WithArchitecture("x86_64").
+				WithDistro(dbtest.RHEL8).
+				WithCPE("cpe:2.3:a:openssl:openssl:1.1.1:*:*:*:*:*:*:*").
+				Build()
+
+			db.Match(t, matcher, p).
+				SelectMatch("CVE-2018-0735").
+				SelectDetailByType(match.CPEMatch).
+				AsCPESearch()
+		})
 }

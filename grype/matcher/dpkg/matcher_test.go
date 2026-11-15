@@ -3,8 +3,11 @@ package dpkg
 import (
 	"testing"
 
+	"github.com/anchore/grype/grype/internal/ignorereasons"
 	"github.com/anchore/grype/grype/match"
+	"github.com/anchore/grype/grype/pkg"
 	"github.com/anchore/grype/internal/dbtest"
+	"github.com/anchore/syft/syft/artifact"
 	syftPkg "github.com/anchore/syft/syft/pkg"
 )
 
@@ -140,4 +143,55 @@ func TestMatcherDpkg_CPEMatchingWhenEnabled(t *testing.T) {
 				})
 		})
 	}
+}
+
+// TestMatcherDpkg_NvdDroppedWhenDistroHasBackportFix covers the backport false-positive the distro
+// feed exists to settle. Debian 11 ships the CVE-2024-0727 fix on the frozen 1.1.1w line as
+// 1.1.1w-0+deb11u2, but NVD only knows upstream version numbers and still considers every 1.1.1
+// release below 1.1.1x vulnerable. With CPE matching on, the NVD CPE finding must be reconciled away
+// against the distro "fixed" verdict instead of being reported as a second, false finding. The only
+// trace is a distro-fixed ignore, so nothing is silently dropped.
+func TestMatcherDpkg_NvdDroppedWhenDistroHasBackportFix(t *testing.T) {
+	dbtest.SharedDBs(t, "all").
+		SelectOnly("debian:11/CVE-2024-0727", "CVE-2024-0727").
+		Run(func(t *testing.T, db *dbtest.DB) {
+			matcher := NewDpkgMatcher(MatcherConfig{UseCPEs: true})
+
+			pkgID := pkg.ID("openssl-backport-fixed")
+			p := dbtest.NewPackage("openssl", "1.1.1w-0+deb11u2", syftPkg.DebPkg). // at the Debian backport fix
+												WithID(pkgID).
+												WithDistro(dbtest.Debian11).
+												WithCPE("cpe:2.3:a:openssl:openssl:1.1.1w:*:*:*:*:*:*:*").
+												Build()
+
+			// no distro match (the package is at/above the fix) and no NVD CPE match (reconciled away).
+			// The suppressed finding is still surfaced as a distro-fixed ignore rather than dropped
+			// silently; asserting the ignore also enforces that zero matches were produced.
+			findings := db.Match(t, matcher, p)
+			findings.Ignores().
+				SelectRelatedPackageIgnore(ignorereasons.DistroFixed, "CVE-2024-0727").
+				ForPackage(pkgID).
+				WithRelationshipType(artifact.OwnershipByFileOverlapRelationship)
+		})
+}
+
+// TestMatcherDpkg_NvdKeptWhenDistroFeedIsSilent verifies the reconciliation does not over-suppress:
+// a third-party package the distro feed has no record for is still matched purely from NVD via CPE,
+// because there is no distro verdict to defer to.
+func TestMatcherDpkg_NvdKeptWhenDistroFeedIsSilent(t *testing.T) {
+	p := dbtest.NewPackage("vendor-openssl", "1.1.1k", syftPkg.DebPkg).
+		WithDistro(dbtest.Debian11).
+		WithCPE("cpe:2.3:a:openssl:openssl:1.1.1k:*:*:*:*:*:*:*").
+		Build()
+
+	dbtest.SharedDBs(t, "all").
+		SelectOnly("CVE-2024-0727").
+		Run(func(t *testing.T, db *dbtest.DB) {
+			matcher := NewDpkgMatcher(MatcherConfig{UseCPEs: true})
+
+			db.Match(t, matcher, p).
+				SelectMatch("CVE-2024-0727").
+				SelectDetailByType(match.CPEMatch).
+				AsCPESearch()
+		})
 }

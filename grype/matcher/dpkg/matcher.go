@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/anchore/grype/grype/internal/ignorereasons"
 	"github.com/anchore/grype/grype/match"
 	"github.com/anchore/grype/grype/matcher/internal"
 	"github.com/anchore/grype/grype/matcher/internal/result"
@@ -41,34 +42,42 @@ func (m *Matcher) Type() match.MatcherType {
 func (m *Matcher) Match(store vulnerability.Provider, p pkg.Package) ([]match.Match, []match.IgnoreFilter, error) {
 	var matches []match.Match
 	var ignores []match.IgnoreFilter
+	// distroVulnerable and distroFixed are the authoritative distro feed's verdict for this package
+	// (and its upstreams). They reconcile the NVD/CPE results so that backported fixes are not
+	// re-reported as vulnerable based on upstream version numbers.
+	var distroVulnerable, distroFixed result.Set
 
 	// Ubuntu ESM (Pro) distros need a two-pass disclosure/resolution match to resolve base disclosures against
 	// ESM-channel fixes, covering both the binary and its source packages. Non-ESM dpkg scans keep the standard path.
 	if shouldUseUbuntuESMMatching(p.Distro) {
-		esmMatches, esmIgnores, err := m.matchUbuntuESM(store, p)
+		esmVulnerable, esmFixed, esmIgnores, err := m.matchUbuntuESM(store, p)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to match Ubuntu ESM: %w", err)
 		}
-		matches = append(matches, esmMatches...)
 		ignores = append(ignores, esmIgnores...)
+		distroVulnerable, distroFixed = esmVulnerable, esmFixed
 	} else {
-		upstreamMatches, upstreamIgnores, err := m.matchUpstreamPackages(store, p)
+		upstreamVulnerable, upstreamFixed, upstreamIgnores, err := m.matchUpstreamPackages(store, p)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to match by source indirection: %w", err)
 		}
-		matches = append(matches, upstreamMatches...)
+		distroVulnerable = distroVulnerable.Merge(upstreamVulnerable)
+		distroFixed = distroFixed.Merge(upstreamFixed)
 		ignores = append(ignores, upstreamIgnores...)
 
 		versionConfig := version.ComparisonConfig{
 			MissingEpochStrategy: m.cfg.MissingEpochStrategy,
 		}
-		exactMatches, exactIgnores, err := internal.MatchPackageByDistro(store, p, nil, m.Type(), &versionConfig)
+		exactVulnerable, exactFixed, err := internal.FindResultsByDistro(store, p, nil, m.Type(), &versionConfig)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to match by exact package name: %w", err)
 		}
-		matches = append(matches, exactMatches...)
-		ignores = append(ignores, exactIgnores...)
+		distroVulnerable = distroVulnerable.Merge(exactVulnerable)
+		distroFixed = distroFixed.Merge(exactFixed)
+		ignores = append(ignores, internal.OwnershipIgnores(p, ignorereasons.DistroFixed, exactFixed.Vulnerabilities()...)...)
 	}
+
+	matches = append(matches, distroVulnerable.ToMatches()...)
 
 	// if configured, also search by CPEs, either for every package or only for packages from EOL distros
 	searchByCPE := m.cfg.UseCPEs
@@ -78,15 +87,16 @@ func (m *Matcher) Match(store vulnerability.Provider, p pkg.Package) ([]match.Ma
 	}
 
 	if searchByCPE {
-		cpeMatches, ignored, err := internal.MatchPackageByCPEs(store, p, m.Type())
+		cpeVulnerable, cpeIgnores, err := internal.FindResultsByCPEs(store, p, m.Type())
 		switch {
 		case errors.Is(err, internal.ErrEmptyCPEMatch):
 			log.WithFields("package", p.Name).Debug("package has no CPEs to match by")
 		case err != nil:
 			log.WithFields("package", p.Name, "error", err).Debug("failed to match by CPEs")
 		default:
-			matches = append(matches, cpeMatches...)
-			ignores = append(ignores, ignored...)
+			reconciledMatches, reconciledIgnores := internal.ReconcileCPEResults(cpeVulnerable, distroVulnerable, distroFixed, cpeIgnores)
+			matches = append(matches, reconciledMatches...)
+			ignores = append(ignores, reconciledIgnores...)
 		}
 	}
 
@@ -97,45 +107,61 @@ func (m *Matcher) Match(store vulnerability.Provider, p pkg.Package) ([]match.Ma
 // the binary package and each of its source (upstream) packages. Ubuntu vulnerability data is source-keyed, so the
 // upstream pass is what actually resolves most fixes. The shared result provider is built from the binary package p,
 // so upstream matches are automatically recorded as indirect (and keyed to p) by the result detail logic.
-func (m *Matcher) matchUbuntuESM(store vulnerability.Provider, p pkg.Package) ([]match.Match, []match.IgnoreFilter, error) {
+func (m *Matcher) matchUbuntuESM(store vulnerability.Provider, p pkg.Package) (result.Set, result.Set, []match.IgnoreFilter, error) {
 	provider := result.NewProvider(store, p, m.Type())
 
-	matches, ignores, err := ubuntuESMMatches(provider, p, m.cfg.MissingEpochStrategy)
+	vulnerable, fixed, ignores, err := ubuntuESMMatches(provider, p, m.cfg.MissingEpochStrategy)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to match by exact package name: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to match by exact package name: %w", err)
 	}
 
 	for _, indirectPackage := range pkg.UpstreamPackages(p) {
-		indirectMatches, indirectIgnores, err := ubuntuESMMatches(provider, indirectPackage, m.cfg.MissingEpochStrategy)
+		indirectVulnerable, indirectFixed, indirectIgnores, err := ubuntuESMMatches(provider, indirectPackage, m.cfg.MissingEpochStrategy)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to find vulnerabilities for dpkg upstream source package: %w", err)
+			return nil, nil, nil, fmt.Errorf("failed to find vulnerabilities for dpkg upstream source package: %w", err)
 		}
-		matches = append(matches, indirectMatches...)
+		vulnerable = vulnerable.Merge(markIndirect(indirectVulnerable, p))
+		fixed = fixed.Merge(indirectFixed)
 		ignores = append(ignores, indirectIgnores...)
 	}
 
-	return matches, ignores, nil
+	return vulnerable, fixed, ignores, nil
 }
 
-func (m *Matcher) matchUpstreamPackages(store vulnerability.Provider, p pkg.Package) ([]match.Match, []match.IgnoreFilter, error) {
-	var matches []match.Match
+func (m *Matcher) matchUpstreamPackages(store vulnerability.Provider, p pkg.Package) (result.Set, result.Set, []match.IgnoreFilter, error) {
+	vulnerable := result.Set{}
+	fixed := result.Set{}
 	var ignores []match.IgnoreFilter
 
 	versionConfig := version.ComparisonConfig{
 		MissingEpochStrategy: m.cfg.MissingEpochStrategy,
 	}
 	for _, indirectPackage := range pkg.UpstreamPackages(p) {
-		indirectMatches, ignored, err := internal.MatchPackageByDistro(store, indirectPackage, &p, m.Type(), &versionConfig)
+		indirectVulnerable, indirectFixed, err := internal.FindResultsByDistro(store, indirectPackage, &p, m.Type(), &versionConfig)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to find vulnerabilities for dpkg upstream source package: %w", err)
+			return nil, nil, nil, fmt.Errorf("failed to find vulnerabilities for dpkg upstream source package: %w", err)
 		}
-		matches = append(matches, indirectMatches...)
-		ignores = append(ignores, ignored...)
+		vulnerable = vulnerable.Merge(markIndirect(indirectVulnerable, p))
+		fixed = fixed.Merge(indirectFixed)
+		// ownership ignores still point at the SBOM package p, matching the previous MatchPackageByDistro behavior
+		ignores = append(ignores, internal.OwnershipIgnores(p, ignorereasons.DistroFixed, indirectFixed.Vulnerabilities()...)...)
 	}
 
-	// we want to make certain that we are tracking the match based on the package from the SBOM (not the indirect package)
-	// however, we also want to keep the indirect package around for future reference
-	match.ConvertToIndirectMatches(matches, p)
+	return vulnerable, fixed, ignores, nil
+}
 
-	return matches, ignores, nil
+// markIndirect records upstream/source results against the SBOM (catalog) package and marks their
+// evidence indirect, the result.Set equivalent of match.ConvertToIndirectMatches.
+func markIndirect(s result.Set, catalogPkg pkg.Package) result.Set {
+	return s.Map(func(r *result.Result) {
+		r.Package = &catalogPkg
+		details := make([]match.Detail, len(r.Details))
+		for i, d := range r.Details {
+			if d.Type == match.ExactDirectMatch {
+				d.Type = match.ExactIndirectMatch
+			}
+			details[i] = d
+		}
+		r.Details = details
+	})
 }

@@ -50,12 +50,15 @@ func markAsIndirectMatches(results result.Set) result.Set {
 // 2. Search for RHEL disclosures for all upstream (source) packages
 // 3. Search for AlmaLinux unaffected records for the binary package and related packages
 // 4. Apply filtering logic to determine which disclosures are still vulnerable on AlmaLinux
-func almaLinuxMatchesWithUpstreams(provider result.Provider, binaryPkg pkg.Package) ([]match.Match, []match.IgnoreFilter, error) {
+func almaLinuxMatchesWithUpstreams(provider result.Provider, binaryPkg pkg.Package) (result.Set, result.Set, []match.IgnoreFilter, error) {
 	if strings.HasSuffix(binaryPkg.Name, "-debuginfo") || strings.HasSuffix(binaryPkg.Name, "-debugsource") {
-		return nil, nil, nil // almalinux explicitly never publishes advisories for RPMs that are only debug material
+		return result.Set{}, result.Set{}, nil, nil // almalinux explicitly never publishes advisories for RPMs that are only debug material
 	}
 
 	var ignored []match.IgnoreFilter
+	// fixed accumulates every RHEL/Alma record that resolves a disclosure as not-vulnerable at this
+	// version, so the CPE reconciliation can suppress the matching NVD finding.
+	fixed := result.Set{}
 
 	// Create a RHEL-compatible distro for finding base disclosures
 	rhelCompatibleDistro := *binaryPkg.Distro
@@ -70,11 +73,13 @@ func almaLinuxMatchesWithUpstreams(provider result.Provider, binaryPkg pkg.Packa
 		internal.OnlyQualifiedPackages(binaryPkg),
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("matcher failed to fetch RHEL disclosures for AlmaLinux binary pkg=%q: %w", binaryPkg.Name, err)
+		return result.Set{}, result.Set{}, nil, fmt.Errorf("matcher failed to fetch RHEL disclosures for AlmaLinux binary pkg=%q: %w", binaryPkg.Name, err)
 	}
 
 	binaryDisclosures := all.Filter(internal.OnlyVulnerableVersions(pkgVersion))
-	ignored = append(ignored, internal.OwnershipIgnores(binaryPkg, IgnoreReasonDistroFixed, all.Remove(binaryDisclosures).Vulnerabilities()...)...)
+	binaryFixed := all.Remove(binaryDisclosures)
+	fixed = fixed.Merge(binaryFixed)
+	ignored = append(ignored, internal.OwnershipIgnores(binaryPkg, IgnoreReasonDistroFixed, binaryFixed.Vulnerabilities()...)...)
 
 	// Step 2: Find RHEL disclosures for upstream (source) packages (indirect match)
 	// Note: We do NOT add epochs to upstream package versions because sourceRPMs often omit epochs
@@ -97,7 +102,9 @@ func almaLinuxMatchesWithUpstreams(provider result.Provider, binaryPkg pkg.Packa
 		}
 
 		upstreamResults := all.Filter(internal.OnlyVulnerableVersions(upstreamVersion))
-		ignored = append(ignored, internal.OwnershipIgnores(binaryPkg, IgnoreReasonDistroFixed, all.Remove(upstreamResults).Vulnerabilities()...)...)
+		upstreamFixed := all.Remove(upstreamResults)
+		fixed = fixed.Merge(upstreamFixed)
+		ignored = append(ignored, internal.OwnershipIgnores(binaryPkg, IgnoreReasonDistroFixed, upstreamFixed.Vulnerabilities()...)...)
 
 		// Mark these as indirect matches since they came from upstream package search
 		upstreamResults = markAsIndirectMatches(upstreamResults)
@@ -109,7 +116,7 @@ func almaLinuxMatchesWithUpstreams(provider result.Provider, binaryPkg pkg.Packa
 	allDisclosures := binaryDisclosures.Merge(upstreamDisclosures)
 
 	if len(allDisclosures) == 0 {
-		return nil, ignored, nil
+		return result.Set{}, fixed, ignored, nil
 	}
 
 	// Step 3: Find AlmaLinux unaffected records for the binary package
@@ -122,7 +129,7 @@ func almaLinuxMatchesWithUpstreams(provider result.Provider, binaryPkg pkg.Packa
 	if err != nil {
 		log.WithFields("error", err, "distro", binaryPkg.Distro, "pkg", binaryPkg.Name).Debug("failed to fetch AlmaLinux unaffected packages")
 		// If we can't get unaffected data, return the original disclosures
-		return allDisclosures.ToMatches(), ignored, nil
+		return allDisclosures, fixed, ignored, nil
 	}
 
 	// Step 4: Find AlmaLinux unaffected records for related packages (source/binary relationships)
@@ -137,9 +144,11 @@ func almaLinuxMatchesWithUpstreams(provider result.Provider, binaryPkg pkg.Packa
 	updatedDisclosures := applyAlmaLinuxUnaffectedFiltering(allDisclosures, allUnaffected, pkgVersion)
 
 	// allUnaffected is not filtered by version constraint, but the correct set gets applied to updatedDisclosures
-	ignored = append(ignored, internal.OwnershipIgnores(binaryPkg, IgnoreReasonAlmaUnaffected, allUnaffected.Remove(updatedDisclosures).Vulnerabilities()...)...)
+	almaSettled := allUnaffected.Remove(updatedDisclosures)
+	fixed = fixed.Merge(almaSettled)
+	ignored = append(ignored, internal.OwnershipIgnores(binaryPkg, IgnoreReasonAlmaUnaffected, almaSettled.Vulnerabilities()...)...)
 
-	return updatedDisclosures.ToMatches(), ignored, nil
+	return updatedDisclosures, fixed, ignored, nil
 }
 
 // findRelatedUnaffectedPackages searches for unaffected packages using source/binary RPM relationships

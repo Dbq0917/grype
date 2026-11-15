@@ -52,7 +52,7 @@ func shouldUseUbuntuESMMatching(d *distro.Distro) bool {
 // Unlike RHEL EUS there is no cross-minor reachability problem: Ubuntu ESM is one line per LTS release and the
 // resolution search only pulls same-minor 'ubuntu:XX.YY' and 'ubuntu:XX.YY+esm' rows, so every '+esm' fix pulled
 // is reachable by construction.
-func ubuntuESMMatches(provider result.Provider, searchPkg pkg.Package, missingEpochStrategy version.MissingEpochStrategy, extra ...vulnerability.Criteria) ([]match.Match, []match.IgnoreFilter, error) {
+func ubuntuESMMatches(provider result.Provider, searchPkg pkg.Package, missingEpochStrategy version.MissingEpochStrategy, extra ...vulnerability.Criteria) (result.Set, result.Set, []match.IgnoreFilter, error) {
 	distroWithoutESM := *searchPkg.Distro
 	distroWithoutESM.Channels = nil // clear the ESM channel so that we can search for the base distro
 
@@ -75,11 +75,11 @@ func ubuntuESMMatches(provider result.Provider, searchPkg pkg.Package, missingEp
 	// find all disclosures for the package in the base distro (e.g. ubuntu:16.04)
 	disclosures, err := provider.FindResults(disclosureCriteria...)
 	if err != nil {
-		return nil, nil, fmt.Errorf("matcher failed to fetch disclosures for distro=%q pkg=%q: %w", searchPkg.Distro, searchPkg.Name, err)
+		return nil, nil, nil, fmt.Errorf("matcher failed to fetch disclosures for distro=%q pkg=%q: %w", searchPkg.Distro, searchPkg.Name, err)
 	}
 
 	if len(disclosures) == 0 {
-		return nil, nil, nil
+		return result.Set{}, result.Set{}, nil, nil
 	}
 
 	resolutionCriteria := []vulnerability.Criteria{
@@ -95,7 +95,7 @@ func ubuntuESMMatches(provider result.Provider, searchPkg pkg.Package, missingEp
 	// find all base distro fixes and ESM fixes for the package (e.g. ubuntu:16.04 || ubuntu:16.04+esm)
 	resolutions, err := provider.FindResults(resolutionCriteria...)
 	if err != nil {
-		return nil, nil, fmt.Errorf("matcher failed to fetch resolutions for distro=%q pkg=%q: %w", searchPkg.Distro, searchPkg.Name, err)
+		return nil, nil, nil, fmt.Errorf("matcher failed to fetch resolutions for distro=%q pkg=%q: %w", searchPkg.Distro, searchPkg.Name, err)
 	}
 
 	esmFixes := resolutions.Filter(search.ByFixedVersion(*pkgVersion))
@@ -110,7 +110,7 @@ func ubuntuESMMatches(provider result.Provider, searchPkg pkg.Package, missingEp
 	//    final set of vulnerabilities is a fused set of disclosures and fixes together.
 	remaining = remaining.Merge(resolutions, mergeESMAdvisoriesIntoMainDisclosures(pkgVersion))
 
-	return remaining.ToMatches(), internal.OwnershipIgnores(searchPkg, IgnoreReasonDistroNotVulnerable, esmFixes.Vulnerabilities()...), nil
+	return remaining, esmFixes, internal.OwnershipIgnores(searchPkg, IgnoreReasonDistroNotVulnerable, esmFixes.Vulnerabilities()...), nil
 }
 
 // mergeESMAdvisoriesIntoMainDisclosures returns a function that filters disclosures based on the provided advisory
