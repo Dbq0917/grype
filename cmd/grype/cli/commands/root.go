@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/anchore/clio"
 	"github.com/anchore/grype/cmd/grype/cli/options"
 	"github.com/anchore/grype/grype"
+	"github.com/anchore/grype/grype/component"
 	"github.com/anchore/grype/grype/distro"
 	"github.com/anchore/grype/grype/event"
 	"github.com/anchore/grype/grype/event/parsers"
@@ -206,6 +208,10 @@ func runGrype(ctx context.Context, app clio.Application, opts *options.Grype, us
 		return err
 	}
 
+	if err := writeComponentIdentityAudit(opts.ComponentIdentityOutput, packages); err != nil {
+		return fmt.Errorf("writing component identity audit: %w", err)
+	}
+
 	defer log.CloseAndLogError(vp, status.Path)
 
 	warnWhenDistroHintNeeded(packages, &pkgContext)
@@ -277,6 +283,29 @@ func runGrype(ctx context.Context, app clio.Application, opts *options.Grype, us
 	log.WithFields("time", time.Since(startTime)).Trace("wrote vulnerability report")
 
 	return errs
+}
+
+func writeComponentIdentityAudit(path string, packages []pkg.Package) error {
+	if path == "" {
+		return nil
+	}
+
+	identities := make([]component.Identity, len(packages))
+	for i := range packages {
+		identities[i] = component.Identify(packages[i])
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+
+	if err := component.WriteAudit(f, identities); err != nil {
+		_ = f.Close()
+		return err
+	}
+
+	return f.Close()
 }
 
 func warnWhenDistroHintNeeded(pkgs []pkg.Package, context *pkg.Context) {
@@ -384,9 +413,12 @@ func getMatcherConfig(opts *options.Grype) matcher.Config {
 			AlwaysUseCPEForStdlib:                  opts.Match.Golang.AlwaysUseCPEForStdlib,
 			AllowMainModulePseudoVersionComparison: opts.Match.Golang.AllowMainModulePseudoVersionComparison,
 		},
-		Rust:  rust.MatcherConfig(opts.Match.Rust),
-		Hex:   hex.MatcherConfig(opts.Match.Hex),
-		Stock: stock.MatcherConfig(opts.Match.Stock),
+		Rust: rust.MatcherConfig(opts.Match.Rust),
+		Hex:  hex.MatcherConfig(opts.Match.Hex),
+		Stock: stock.MatcherConfig{
+			UseCPEs:                        opts.Match.Stock.UseCPEs,
+			AllowEcosystemlessNameMatching: opts.Match.Stock.AllowEcosystemlessNameMatching,
+		},
 		Dpkg: dpkg.MatcherConfig{
 			MissingEpochStrategy: opts.Match.Dpkg.MissingEpochStrategy,
 			UseCPEsForEOL:        opts.Match.Dpkg.UseCPEsForEOL,

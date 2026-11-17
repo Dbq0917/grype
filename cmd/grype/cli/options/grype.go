@@ -14,6 +14,7 @@ import (
 type Grype struct {
 	Outputs                    []string           `yaml:"output" json:"output" mapstructure:"output"` // -o, <presenter>=<file> the Presenter hint string to use for report formatting and the output file
 	File                       string             `yaml:"file" json:"file" mapstructure:"file"`       // --file, the file to write report output to
+	ComponentIdentityOutput    string             `yaml:"component-identity-output" json:"component-identity-output" mapstructure:"component-identity-output"`
 	Pretty                     bool               `yaml:"pretty" json:"pretty" mapstructure:"pretty"`
 	Distro                     string             `yaml:"distro" json:"distro" mapstructure:"distro"`                                           // --distro, specify a distro to explicitly use
 	GenerateMissingCPEs        bool               `yaml:"add-cpes-if-none" json:"add-cpes-if-none" mapstructure:"add-cpes-if-none"`             // --add-cpes-if-none, automatically generate CPEs if they are not present in import (e.g. from a 3rd party SPDX document)
@@ -94,6 +95,11 @@ func (o *Grype) AddFlags(flags clio.FlagSet) {
 	flags.StringVarP(&o.File,
 		"file", "",
 		"file to write the default report output to (default is STDOUT)",
+	)
+
+	flags.StringVarP(&o.ComponentIdentityOutput,
+		"component-identity-output", "",
+		"write the component identity evidence used for matching to the given JSON file",
 	)
 
 	flags.StringVarP(&o.Name,

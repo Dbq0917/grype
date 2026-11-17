@@ -18,7 +18,7 @@ type matchConfig struct {
 	Ruby       matcherConfig `yaml:"ruby" json:"ruby" mapstructure:"ruby"`                   // settings for the ruby matcher
 	Rust       matcherConfig `yaml:"rust" json:"rust" mapstructure:"rust"`                   // settings for the rust matcher
 	Hex        matcherConfig `yaml:"hex" json:"hex" mapstructure:"hex"`                      // settings for the hex matcher (Elixir/Erlang)
-	Stock      matcherConfig `yaml:"stock" json:"stock" mapstructure:"stock"`                // settings for the default/stock matcher
+	Stock      stockConfig   `yaml:"stock" json:"stock" mapstructure:"stock"`                // settings for the default/stock matcher
 	Dpkg       dpkgConfig    `yaml:"dpkg" json:"dpkg" mapstructure:"dpkg"`                   // settings for the dpkg matcher
 	Rpm        rpmConfig     `yaml:"rpm" json:"rpm" mapstructure:"rpm"`                      // settings for the rpm matcher
 }
@@ -30,6 +30,15 @@ var _ interface {
 
 type matcherConfig struct {
 	UseCPEs bool `yaml:"using-cpes" json:"using-cpes" mapstructure:"using-cpes"` // if CPEs should be used during matching
+}
+
+type stockConfig struct {
+	matcherConfig `yaml:",inline" mapstructure:",squash"`
+
+	// AllowEcosystemlessNameMatching is a rollback switch for the pre-component-identity
+	// behavior. When true, a package with no language/type/PURL evidence searches every
+	// language namespace by name, which can produce cross-ecosystem findings.
+	AllowEcosystemlessNameMatching bool `yaml:"allow-ecosystemless-name-matching" json:"allow-ecosystemless-name-matching" mapstructure:"allow-ecosystemless-name-matching"`
 }
 
 type golangConfig struct {
@@ -127,7 +136,7 @@ func defaultMatchConfig() matchConfig {
 		Ruby:       dontUseCpe,
 		Rust:       dontUseCpe,
 		Hex:        dontUseCpe,
-		Stock:      useCpe,
+		Stock:      stockConfig{matcherConfig: useCpe},
 		Dpkg:       defaultDpkgConfig(),
 		Rpm:        defaultRpmConfig(),
 	}
@@ -174,6 +183,7 @@ func (cfg *matchConfig) DescribeFields(descriptions clio.FieldDescriptionSet) {
 	descriptions.Add(&cfg.Rust.UseCPEs, usingCpeDescription)
 	descriptions.Add(&cfg.Hex.UseCPEs, usingCpeDescription)
 	descriptions.Add(&cfg.Stock.UseCPEs, usingCpeDescription)
+	descriptions.Add(&cfg.Stock.AllowEcosystemlessNameMatching, `rollback switch: allow name-only matching across all language ecosystems when a package has no language, type, or PURL evidence`)
 	descriptions.Add(&cfg.Dpkg.UseCPEs, usingCpeDescription)
 	descriptions.Add(&cfg.Rpm.UseCPEs, usingCpeDescription)
 	descriptions.Add(&cfg.Dpkg.MissingEpochStrategy,

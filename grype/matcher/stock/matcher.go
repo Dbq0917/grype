@@ -14,6 +14,12 @@ type Matcher struct {
 
 type MatcherConfig struct {
 	UseCPEs bool
+
+	// AllowEcosystemlessNameMatching restores the legacy behavior of searching
+	// every language namespace by package name when the cataloged package has
+	// no language/type/PURL evidence. It is a rollback switch only; leave it
+	// false so CPE-only inputs cannot collect cross-ecosystem advisories.
+	AllowEcosystemlessNameMatching bool
 }
 
 func NewStockMatcher(cfg MatcherConfig) match.Matcher {
@@ -31,5 +37,8 @@ func (m *Matcher) Type() match.MatcherType {
 }
 
 func (m *Matcher) Match(store vulnerability.Provider, p pkg.Package) ([]match.Match, []match.IgnoreFilter, error) {
+	if m.cfg.AllowEcosystemlessNameMatching {
+		return internal.MatchPackageByEcosystemAndCPEsLegacy(store, p, m.Type(), m.cfg.UseCPEs)
+	}
 	return internal.MatchPackageByEcosystemAndCPEs(store, p, m.Type(), m.cfg.UseCPEs)
 }

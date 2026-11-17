@@ -6,6 +6,10 @@ test:
 snapshot:
 	@go run -C .make . snapshot
 
+.PHONY: test-component-identity
+test-component-identity:
+	@./test/component-identity/run.sh
+
 .PHONY: *
 .DEFAULT_GOAL: make-default
 
